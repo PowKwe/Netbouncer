@@ -107,6 +107,7 @@ IDX=$(cat /sys/class/net/wlan0/ifindex)
 TABLE=$((1000 + IDX))
 
 # 4. Add policy routing rules for Tailscale traffic
+ip rule add iif tailscale0 lookup main pref 4999 2>/dev/null
 ip rule add iif tailscale0 lookup $TABLE pref 5000 2>/dev/null
 
 # 5. Configure NAT and allow forwarding for the tailscale0 interface
