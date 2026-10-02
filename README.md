@@ -86,7 +86,7 @@ On top of the patched binary, **one additional fix was required on-device** that
 
 ## Master boot script (`master-boot.sh`)
 
-Install at `/data/adb/service.d/master-boot.sh`. Handles kernel forwarding, NAT, redirects dns requests (see [Pi-hole](#pi-hole-dns--ad-blocking-integration)) and launching `tailscaled` — **does not** launch sshd (see [SSH access](#ssh-access) for why).
+Install at `/data/adb/service.d/master-boot.sh`. Handles kernel forwarding, NAT, redirects dns requests (see [Pi-hole](#pi-hole-dns--ad-blocking-integration-(proot-container))) and launching `tailscaled` — **does not** launch sshd (see [SSH access](#ssh-access) for why).
 
 ```sh
 #!/system/bin/sh
