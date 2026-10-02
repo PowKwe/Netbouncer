@@ -1,275 +1,202 @@
 # Tailscale Kernel-Mode Exit Node / Subnet Router on Rooted Android
 
-Turns a rooted Android device (tested on a Samsung Galaxy S10+, Exynos, Magisk-rooted) into a genuine **kernel-mode** Tailscale subnet router and exit node — a real `tailscale0` TUN interface with in-kernel routing and NAT, not Tailscale's `userspace-networking` fallback mode.
+Turns a rooted Android phone into a real **kernel-mode** Tailscale subnet router and exit node: a genuine `tailscale0` TUN interface with in-kernel routing and NAT, not Tailscale's `userspace-networking` fallback.
 
-This matters because stock Android and stock Tailscale binaries don't get along at the routing layer. This repo documents the fix and ships a working boot-persistence script.
+Tested on a Samsung Galaxy S10+ (Exynos), rooted with Magisk.
 
-## Why this is harder than it looks on Linux
+**What's in this repo**
 
-On a normal Linux box, Tailscale's router code inserts a handful of `ip rule` entries and everything works. Android breaks this in two independent ways:
+- A fix for the two ways Android breaks stock Tailscale's routing (see [Why this is harder than on Linux](#why-this-is-harder-than-on-linux))
+- A boot script (`master-boot.sh`) that makes the setup survive reboots
+- Two optional add-ons: [SSH access](#optional-ssh-access) and [Pi-hole ad-blocking](#optional-pi-hole-dns-and-ad-blocking)
 
-1. **fwmark collisions.** Android's `netd` reserves the lower bits of the 32-bit socket fwmark for its own per-network/per-UID bookkeeping. Stock Tailscale's default fwmark allocation overlaps that reserved range, corrupting or being corrupted by Android's own packet marking.
-2. **Policy-routing (RPDB) interference.** Android maintains dozens of `ip rule` entries per network/UID range at priorities generally ≥ 10000, used for per-app VPN routing, metered-connection logic, and multi-network handling. Stock Tailscale's rule-insertion logic assumes a much simpler Linux routing setup and installs rules at priorities that either get shadowed by Android's rules, or — worse — bypass them entirely and corrupt Android's own routing decisions for unrelated traffic.
+## Contents
 
-The result: stock `tailscaled` either silently falls back to non-functional routing, or actively interferes with the phone's normal network behavior.
+1. [Why this is harder than on Linux](#why-this-is-harder-than-on-linux)
+2. [The fix](#the-fix)
+3. [Requirements](#requirements)
+4. [Installation](#installation)
+5. [The boot script](#the-boot-script-master-bootsh)
+6. [Verification](#verification)
+7. [Optional: SSH access](#optional-ssh-access)
+8. [Optional: Pi-hole DNS and ad-blocking](#optional-pi-hole-dns-and-ad-blocking)
+9. [Troubleshooting](#troubleshooting)
+10. [Credits](#credits) · [Disclaimer](#disclaimer)
+
+---
+
+## Why this is harder than on Linux
+
+On a normal Linux box, Tailscale inserts a few `ip rule` entries and everything works. Android breaks that in two independent ways:
+
+1. **fwmark collisions.** Android's `netd` reserves the lower bits of the 32-bit socket fwmark for its own per-network and per-UID bookkeeping. Stock Tailscale's default fwmark bits overlap that range, so each side can corrupt the other's packet marks.
+2. **Policy-routing (RPDB) interference.** Android keeps dozens of `ip rule` entries per network/UID range, generally at priority 10000 or higher, for per-app VPNs, metered-connection logic and multi-network handling. Stock Tailscale assumes a much simpler setup. Its rules are either shadowed by Android's, or they bypass Android's rules and disturb routing for unrelated traffic.
+
+The result: stock `tailscaled` either silently falls back to non-functional routing or interferes with the phone's normal networking.
 
 ## The fix
 
-This setup relies on a patched Android-aware fork of Tailscale ([`android-kxxt/external_tailscale`](https://github.com/android-kxxt/external_tailscale)) that:
+The setup uses a patched, Android-aware fork of Tailscale, [`android-kxxt/external_tailscale`](https://github.com/android-kxxt/external_tailscale), which:
 
-- Remaps Tailscale's fwmark bits to the unclaimed bit range Android's `netd` leaves free, avoiding collision.
-- Replaces Tailscale's default multi-rule `ip rule` insertion with a single simplified rule placed at a priority that doesn't shadow Android's own rules.
-- Patches `go-iptables` to tolerate Android's non-standard iptables error strings.
+- moves Tailscale's fwmark bits into the range Android's `netd` leaves unclaimed;
+- replaces Tailscale's multi-rule `ip rule` insertion with a single rule at a priority that doesn't shadow Android's;
+- patches `go-iptables` to tolerate Android's non-standard iptables error strings.
 
-On top of the patched binary, **one additional fix was required on-device** that isn't part of the upstream patch: an explicit `ip rule` telling the kernel to resolve forwarded `tailscale0` traffic against the `main` routing table. Without it, packets arrive on the tun interface and are correctly accepted into the `FORWARD` chain by iptables, but the kernel has no rule that resolves a next-hop route for them, so nothing ever actually gets forwarded — despite every iptables rule looking correct. This is the fix that took the router from "device shows exit node offered, client shows connected, zero actual internet passes through" to working.
+**One extra fix is needed on-device** and is not part of the upstream patch: explicit `ip rule` entries that make the kernel resolve a next hop for packets arriving on `tailscale0` (the first one points at the `main` table; the second at the Wi-Fi network's own routing table; see [step 4 of the boot script](#the-boot-script-master-bootsh)). Without them, packets reach the tun interface and are accepted by the `FORWARD` chain, but no route is found, so nothing is forwarded even though every iptables rule looks correct. This is what takes the router from "exit node offered, client connected, zero traffic" to working.
 
 ## Requirements
 
 - Rooted Android device with Magisk
-- Root shell access (via Termux + `su`, or ADB)
-- A prebuilt or self-built `tailscale` / `tailscaled` binary from the patched fork, matching your device's ABI (arm64 for most modern devices)
+- Root shell access (Termux + `su`, or ADB)
+- `tailscale` and `tailscaled` binaries from the patched fork, built for your device's ABI (arm64 on most modern devices)
 - A Tailscale account
-- [**Termux:Boot**](https://github.com/termux/termux-boot) (from the same source as your Termux install — F-Droid and Play Store builds are not always signature-compatible with each other, so mismatched sources will fail to talk to each other)
+- **For the optional add-ons only:** [Termux](https://github.com/termux/termux-app) and [Termux:Boot](https://github.com/termux/termux-boot). Install both from the **same source** (F-Droid or Play Store); builds from different sources are not signature-compatible and won't talk to each other.
 
 ## Installation
 
-1. **Get the patched binaries.**
-   Either download a prebuilt release matching your ABI, or build from source:
+### 1. Get the patched binaries
 
-   ```sh
-   git clone https://github.com/android-kxxt/external_tailscale.git
-   cd external_tailscale
-   GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -o tailscaled ./cmd/tailscaled
-   GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -o tailscale ./cmd/tailscale
-   ```
+Download a prebuilt release for your ABI if one is available, or build from source:
 
-   Verify the fork isn't badly stale against current Tailscale releases — an old enough build may fail to authenticate against the current control-plane protocol.
+```sh
+git clone https://github.com/android-kxxt/external_tailscale.git
+cd external_tailscale
+GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -o tailscaled ./cmd/tailscaled
+GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -o tailscale ./cmd/tailscale
+```
 
-2. **Push the binaries to persistent storage on-device:**
+Check that the fork isn't badly out of date with current Tailscale releases; a build that is too old may fail to authenticate against the current control-plane protocol.
 
-   ```sh
-   su -c 'mkdir -p /data/adb/tailscale'
-   su -c 'cp tailscale tailscaled /data/adb/tailscale/'
-   su -c 'chmod 755 /data/adb/tailscale/tailscale /data/adb/tailscale/tailscaled'
-   su -c 'chown root:root /data/adb/tailscale/tailscale /data/adb/tailscale/tailscaled'
-   ```
+### 2. Put the binaries on the device
 
-3. **Install the Magisk boot script.**
-   Copy `master-boot.sh` (below) to `/data/adb/service.d/master-boot.sh` and mark it executable:
+Copy them to somewhere readable first (for example `adb push tailscale tailscaled /data/local/tmp/`), then, from a root shell:
 
-   ```sh
-   chmod 755 /data/adb/service.d/master-boot.sh
-   ```
+```sh
+mkdir -p /data/adb/tailscale
+cp /data/local/tmp/tailscale /data/local/tmp/tailscaled /data/adb/tailscale/
+chmod 755 /data/adb/tailscale/tailscale /data/adb/tailscale/tailscaled
+chown root:root /data/adb/tailscale/tailscale /data/adb/tailscale/tailscaled
+```
 
-   Magisk's `service.d` scripts run post-boot, after CE storage is decrypted — this is what you want for a daemon that needs persistent state.
+### 3. Install the boot script
 
-4. **Install Termux:Boot and the sshd boot script** (see [SSH access](#ssh-access) below) — do this now, before your first reboot, so both pieces are in place together.
+Save the script from [The boot script](#the-boot-script-master-bootsh) as `/data/adb/service.d/master-boot.sh`, then (as root):
 
-5. **Reboot**, then confirm the kernel tun device exists:
+```sh
+chmod 755 /data/adb/service.d/master-boot.sh
+```
 
-   ```sh
-   ip link show tailscale0
-   ```
+Magisk runs `service.d` scripts late in boot. The script itself waits for `sys.boot_completed` before doing anything.
 
-6. **Authenticate and configure the router** (one-time, via a root shell):
+### 4. Reboot and check the interface
 
-   ```sh
-   /data/adb/tailscale/tailscale --socket=/data/adb/tailscale/tailscaled.sock up \
-     --accept-dns=false \
-     --advertise-routes=192.168.X.0/24 \
-     --advertise-exit-node
-   ```
+```sh
+ip link show tailscale0
+```
 
-   Open the printed login URL and approve the device. Settings persist in the daemon's state file — you won't need to run `up` again after reboots.
+### 5. Authenticate and configure the router (one time, root shell)
 
-7. **Approve the route and exit-node capability** in the [Tailscale admin console](https://login.tailscale.com/admin/machines) — advertising isn't the same as active; both need manual approval before any client can actually use them.
+```sh
+/data/adb/tailscale/tailscale --socket=/data/adb/tailscale/tailscaled.sock up \
+  --accept-dns=false \
+  --advertise-routes=192.168.X.0/24 \
+  --advertise-exit-node
+```
 
-## Master boot script (`master-boot.sh`)
+Replace `192.168.X.0/24` with your LAN subnet. Open the printed login URL and approve the device. The settings are stored in the daemon's state file, so you don't need to run `up` again after reboots.
 
-Install at `/data/adb/service.d/master-boot.sh`. Handles kernel forwarding, NAT, redirects dns requests (see [Pi-hole](#pi-hole-dns--ad-blocking-integration-(proot-container))) and launching `tailscaled` — **does not** launch sshd (see [SSH access](#ssh-access) for why).
+### 6. Approve the route and exit node in the admin console
+
+Open the [Tailscale admin console](https://login.tailscale.com/admin/machines) and approve both. Advertising is not the same as being active: clients can't use the subnet route or exit node until you approve them.
+
+Then run through [Verification](#verification). SSH and Pi-hole are optional and covered further down.
+
+---
+
+## The boot script (`master-boot.sh`)
+
+Install at `/data/adb/service.d/master-boot.sh`. It enables forwarding, adds the routing and NAT rules, optionally redirects DNS to Pi-hole, and starts `tailscaled`. It deliberately does **not** start `sshd` ([why](#why-sshd-is-not-in-the-magisk-script)).
 
 ```sh
 #!/system/bin/sh
+# --- Settings ---------------------------------------------------------------
+UPLINK=wlan0          # Interface that carries your internet/LAN traffic.
+                      # Find it with: ip route get 8.8.8.8 (or look for the
+                      # interface holding your LAN subnet in: ip route show)
+PIHOLE_REDIRECT=0     # Set to 1 only after Pi-hole is installed and running
+                      # (see the Pi-hole section). Leave at 0 otherwise, or
+                      # DNS will break for every client using this node.
+# ----------------------------------------------------------------------------
+
 until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 1; done
 sleep 10
 
-# 1. Enable IP forwarding for IPv4 and IPv6
+# 1. Enable IP forwarding (IPv4 and IPv6)
 echo 1 > /proc/sys/net/ipv4/ip_forward
 echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 
-# 2. Disable Reverse Path Filtering to prevent Android from dropping packets
+# 2. Disable reverse-path filtering so Android doesn't drop forwarded packets
 echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
 echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
-echo 0 > /proc/sys/net/ipv4/conf/wlan0/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/$UPLINK/rp_filter
 
-# 3. Determine the dynamic Android routing table for wlan0
-IDX=$(cat /sys/class/net/wlan0/ifindex)
+# 3. Find Android's per-network routing table for the uplink (1000 + ifindex)
+IDX=$(cat /sys/class/net/$UPLINK/ifindex 2>/dev/null)
 TABLE=$((1000 + IDX))
 
-# 4. Add policy routing rules for Tailscale traffic
-ip rule add iif tailscale0 lookup main pref 4999 2>/dev/null
-ip rule add iif tailscale0 lookup $TABLE pref 5000 2>/dev/null
+# 4. Policy routing for traffic arriving from Tailscale. The deletes make the
+#    script safe to re-run without piling up duplicate rules.
+ip rule del iif tailscale0 lookup main pref 4999 2>/dev/null
+ip rule add iif tailscale0 lookup main pref 4999
+if [ -n "$IDX" ]; then
+    ip rule del iif tailscale0 lookup $TABLE pref 5000 2>/dev/null
+    ip rule add iif tailscale0 lookup $TABLE pref 5000
+fi
 
-# 5. Configure NAT and allow forwarding for the tailscale0 interface
-iptables -t nat -I POSTROUTING -o wlan0 -j MASQUERADE
-iptables -I FORWARD -i tailscale0 -j ACCEPT
-iptables -I FORWARD -o tailscale0 -j ACCEPT
+# 5. NAT and forwarding (each rule is only added if it isn't already present)
+iptables -t nat -C POSTROUTING -o $UPLINK -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -I POSTROUTING -o $UPLINK -j MASQUERADE
+iptables -C FORWARD -i tailscale0 -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -i tailscale0 -j ACCEPT
+iptables -C FORWARD -o tailscale0 -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -o tailscale0 -j ACCEPT
 
-# 6. DNS Redirection (Android port 53 -> PRoot Pi-hole port 5353)
-iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || \
-    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353
+# 6. Optional: redirect DNS (port 53) to Pi-hole listening on port 5353
+if [ "$PIHOLE_REDIRECT" = "1" ]; then
+    for proto in udp tcp; do
+        iptables -t nat -C PREROUTING -p $proto --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || \
+            iptables -t nat -A PREROUTING -p $proto --dport 53 -j REDIRECT --to-ports 5353
+    done
+fi
 
-iptables -t nat -C PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || \
-    iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353
-
-# 7. Launch Tailscale in True Kernel Mode
+# 7. Start Tailscale in kernel mode
 env XDG_CACHE_HOME=/data/adb/tailscale \
 /data/adb/tailscale/tailscaled \
---state=/data/adb/tailscale/tailscaled.state \
---socket=/data/adb/tailscale/tailscaled.sock &
+    --state=/data/adb/tailscale/tailscaled.state \
+    --socket=/data/adb/tailscale/tailscaled.sock &
 
-# 8. Wait for the tailscale0 interface to initialize, then disable its rp_filter
+# 8. Once tailscale0 exists, disable its rp_filter too
 sleep 5
 echo 0 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2>/dev/null
 ```
 
-Adjust `wlan0` throughout if your device's uplink interface has a different name (check with `ip route get 8.8.8.8`).
+Notes on what the script does and doesn't cover:
 
+- **Why two `ip rule` entries?** The first (priority 4999) resolves routes from the `main` table. The second (priority 5000) falls back to Android's own table for the uplink, which is where the default route lives. Both only match traffic arriving on `tailscale0`, and both sit at lower numbers than Android's own rules (10000+), so they are checked first.
+- **The uplink table is computed once, at boot.** The Wi-Fi interface must exist when the script runs. If it doesn't, the second rule is skipped.
+- **Auto-detecting the uplink is unreliable, so it is set by hand.** On the tested device `/proc/net/route` contains no default route (Android keeps it in per-network tables, which also supports the two-rule explanation above), `ip route get` wasn't available in Termux, and `ip -o` output wasn't usable. Parsing `ip route show` for `dev <iface>` worked, but a fixed `UPLINK` is the simplest and most predictable.
+- **Mobile data isn't covered.** NAT is applied to `$UPLINK` only. To route out over cellular you would need a matching `MASQUERADE` rule for that interface (typically `rmnet*`).
+- **IPv6 is forwarded but not NATed.** The script enables IPv6 forwarding but only adds IPv4 (`iptables`) rules. Exit-node traffic is therefore effectively IPv4-only.
 
-## Pi-hole DNS & Ad-Blocking Integration (PRoot Container)
-
-To turn this rooted Android node into a complete network-wide ad-blocker, Pi-hole (v6) runs inside an isolated Ubuntu PRoot container managed by proot-distro, bridged to the network via Magisk iptables redirection rules and kept alive across reboots via Termux:Boot.
-
-### Architecture & Port Mapping
-Because Android restricts non-root user-space applications from binding to privileged ports (< 1024), Pi-hole is configured with a split-port layout:
-
-  - DNS (Port 5353 inside PRoot): Intercepted at the system level by Magisk and redirected from standard port 53.
-
-  - Web Dashboard (Port 8080): Accessible locally or over Tailscale for administration.
-
-### Installation & Setup
-
-  1. **Install PRoot-Distro and Ubuntu inside Termux:**
-  ```sh
-  pkg install proot-distro
-  proot-distro install ubuntu
-  ```
-  2. **Install Required Dependencies inside Ubuntu:**
-  
-  Before running the Pi-hole installer, enter the container and install essential administrative and networking utilities:
-  ```sh
-  proot-distro login ubuntu
-  apt update && apt upgrade -y
-  apt install curl wget sudo nano dialog tzdata iproute2 -y
-  ```
-  3. **Configure Unattended Pi-hole Installation:**
-    Because standard interactive installation scripts fail inside a PRoot environment, we configure an automated (unattended) installation by creating the pre-seed variables file (``setupVars.conf``) beforehand using a Heredoc block. Run this inside Termux:
-
-  ```sh
-    mkdir -p /etc/pihole
-    cat << EOF > /etc/pihole/setupVars.conf
-    PIHOLE_INTERFACE=wlan0
-    IPV4_ADDRESS=127.0.0.1/24
-    IPV6_ADDRESS=
-    PIHOLE_DNS_1=8.8.8.8
-    PIHOLE_DNS_2=1.1.1.1
-    INSTALL_WEB_SERVER=true
-    INSTALL_WEB_INTERFACE=true
-    LIGHTTPD_ENABLED=true
-    QUERY_LOGGING=true
-    DNSMASQ_LISTENING=all
-    EOF
-  ```
-4. **Run the Automated Installer:**
-  Execute the official Pi-hole installer in non-interactive (unattended) mode, telling it to use the pre-seeded configuration file we just created:
-    ```sh
-    curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended
-    ```
-5. **Configure Boot Persistence for Pi-hole (``Termux:Boot``):**
-
-  Termux:Boot executes scripts in a stripped-down environment that lacks normal interactive session variables (``PATH``, ``PREFIX``, ``HOME``, and ``LD_PRELOAD``). Furthermore, PRoot requires the main process launched inside it to remain alive, or the container shuts down entirely.
-  
-  In Termux (regular session $): 
-  ```sh
-  cat << EOF > ~/.termux/boot/start-pihole.sh
-  #!/data/data/com.termux/files/usr/bin/sh
-
-# Restore the Termux environment variables required for proot-distro
-export PATH=/data/data/com.termux/files/usr/bin:/system/bin
-export PREFIX=/data/data/com.termux/files/usr
-export HOME=/data/data/com.termux/files/home
-export LD_PRELOAD=/data/data/com.termux/files/usr/lib/libtermux-exec.so
-
-# Wait for the Android network and Termux environment to fully initialize
-sleep 15
-
-# Clean up stale lock files or sockets from improper shutdowns
-proot-distro login ubuntu -- rm -f /run/pihole/FTL.sock /run/pihole-FTL.pid /run/pihole-FTL.port /etc/pihole/pihole-FTL.db-journal 2>/dev/null
-
-# Launch FTL in the foreground (-f) inside the container to keep PRoot alive, 
-# while sending the proot command itself to the background (&).
-nohup proot-distro login ubuntu -- pihole-FTL -f > /dev/null 2>&1 &
-  EOF
-
-  ```
-Then give it running privileges:
-```sh
-chmod 755 ~/.termux/boot/start-pihole.sh
-```
-
-6. **Avoiding a collision with the Android daemon (``netd``):**
-  
-  Port 53 is blocked by the native operating system. We are moving Pi-hole services (version 6) to available ports:
-  ```sh
-  pihole-FTL --config dns.port 5353
-  pihole-FTL --config webserver.port "8080,[::]:8080"
-```
-7. **Creating the logs and launching the service:**
-
-  PRoot does not automatically recreate volatile folders (``/var/run`` or certain logs). We set the permissions and password, and start the daemon in the background:
-  ```sh
-  mkdir -p /var/log/pihole
-  chown pihole:pihole /var/log/pihole
-  pihole setpassword
-  ```
-  Either launch the service in the background with ``pihole-FTL &`` manually or reboot the device in order to launch ``start-pihole.sh`` 
-## SSH access
-
-**Don't launch sshd from the Magisk `service.d` script.** Doing so via `su ${TERMUX_UID} -c ...` switches the process to Termux's UID number, but the resulting process does **not** get the same Linux group memberships or SELinux context a normally-launched Termux app process gets:
-
-|                 | Normal Termux launch                 | `su <uid>` from Magisk script      |
-| --------------- | ------------------------------------ | ---------------------------------- |
-| Groups          | `...,3003(inet),9997(everybody),...` | _(none — just the base UID group)_ |
-| SELinux context | `u:r:untrusted_app_27:s0:...`        | `u:r:magisk:s0`                    |
-
-Critically, it's missing the `inet` group (gid 3003), which gates permission to create network sockets the way Android expects for an app process. In practice this causes exactly the symptom that prompted this section: SSH into a `service.d`-launched sshd and `pkg update`/`pkg install` fail with "all mirrors bad," while the same commands work fine the moment you physically open Termux and start sshd from inside it — because _that_ process goes through Android's normal Zygote-fork app-launch path and gets the correct groups and context.
-
-**Fix: launch sshd through Termux's own boot mechanism (Termux:Boot) instead of through Magisk.**
-
-1. Install [Termux:Boot](https://github.com/termux/termux-boot) from the same source (F-Droid or Play Store, matching whichever you used for Termux itself).
-2. Open the Termux:Boot app once so Android registers its boot receiver.
-3. In Termux (physically opened):
-   ```sh
-   mkdir -p ~/.termux/boot
-   ```
-   Create `~/.termux/boot/start-sshd.sh`:
-   ```sh
-   #!/data/data/com.termux/files/usr/bin/sh
-   sshd
-   ```
-   ```sh
-   chmod +x ~/.termux/boot/start-sshd.sh
-   ```
-4. Reboot and test SSH **without** opening Termux on-screen first — that's the real test that the daemon is launching through the correct app-context path.
-
-If Termux:Boot proves unreliable on your specific OEM skin (a known occasional issue on some Android builds, since it depends on the boot-completed broadcast reaching a non-foreground app reliably), the fallback is opening Termux manually once per reboot before relying on SSH-triggered package operations.
+---
 
 ## Verification
 
-Confirm the setup is actually forwarding traffic, not just configured to:
+Confirm the router is actually forwarding traffic, not merely configured to:
 
 ```sh
-# Policy routing: should show Tailscale's fwmark rule below Android's netd rules
+# Policy routing: your rules at 4999/5000 and Tailscale's rule should be
+# evaluated before Android's netd rules (lower number = checked first)
 ip rule
 
 # Tailscale's own routing table
@@ -278,45 +205,308 @@ ip route show table 52
 # Daemon status and peer connectivity
 /data/adb/tailscale/tailscale --socket=/data/adb/tailscale/tailscaled.sock status
 
-# The real proof: FORWARD and NAT counters should climb under active client load,
-# not just exist
+# Forwarding and NAT counters: these must GROW while a client is using the node
 iptables -L FORWARD -n -v
 iptables -t nat -L POSTROUTING -n -v
+
+# Tailscale's own chains (present only if the daemon created them)
+iptables -L ts-input -n -v
+iptables -L ts-forward -n -v
 ```
 
-A route being "approved" in the admin console and a route being "actually forwarding packets" are different things — always confirm with nonzero, growing packet counters under real client traffic, not just green checkmarks in the UI.
+"Approved" in the admin console and "forwarding packets" are different things. Always confirm with nonzero, growing counters under real client traffic, not just green checkmarks.
+
+---
+
+## Optional: SSH access
+
+Handy for administering the phone from your tailnet.
+
+### Why sshd is not in the Magisk script
+
+Starting `sshd` from a Magisk `service.d` script (for example with `su <termux-uid> -c ...`) switches the process to Termux's UID, but it does **not** get the group memberships or SELinux context of a normally launched Termux app:
+
+|                 | Normal Termux launch                 | `su <uid>` from a Magisk script    |
+| --------------- | ------------------------------------ | ---------------------------------- |
+| Groups          | `...,3003(inet),9997(everybody),...` | _(none; just the base UID group)_  |
+| SELinux context | `u:r:untrusted_app_27:s0:...`        | `u:r:magisk:s0`                    |
+
+The missing `inet` group (gid 3003) is what gates network socket creation for app processes. The symptom: over SSH into such an `sshd`, `pkg update` and `pkg install` fail with "all mirrors bad", yet the same commands work once you open Termux physically and start `sshd` there, because that process comes from Android's normal app-launch path.
+
+**Fix:** start `sshd` through Termux:Boot instead.
+
+### Setup
+
+1. Install Termux:Boot (same source as Termux; see [Requirements](#requirements)) and **open the app once** so Android registers its boot receiver.
+2. Set Termux:Boot's battery usage to **Unrestricted** in Android settings (needed on Samsung and similar skins, or the boot broadcast may never arrive).
+3. Set a password (`passwd`) or add your key to `~/.ssh/authorized_keys` in Termux. Termux's `sshd` listens on port **8022**, not 22.
+4. In Termux, create the boot script:
+   ```sh
+   mkdir -p ~/.termux/boot
+   cat > ~/.termux/boot/start-sshd.sh << 'EOF'
+   #!/data/data/com.termux/files/usr/bin/sh
+   termux-wake-lock    # keep the CPU from deep-sleeping while sshd runs
+   sshd
+   EOF
+   chmod +x ~/.termux/boot/start-sshd.sh
+   ```
+5. Reboot, then test SSH **without** opening Termux on screen first. That is the real test that the daemon starts through the correct app context.
+
+If Termux:Boot is unreliable on your OEM skin (it depends on the boot-completed broadcast reaching a background app), fall back to opening Termux manually once after each reboot.
+
+---
+
+## Optional: Pi-hole DNS and ad-blocking
+
+Turns the phone into a network-wide ad-blocker. Pi-hole v6 runs inside an Ubuntu PRoot container (`proot-distro`), is reached through a Magisk iptables redirect, and is started at boot by Termux:Boot.
+
+**Status:** tested end to end. Queries from a tailnet client appear in the Pi-hole query log, and after a reboot an `nmap` scan from the LAN shows port 53 (dnsmasq/Pi-hole), 8080 (dashboard) and 8022 (SSH) open.
+
+**Do this after the core setup works.** Don't enable the DNS redirect in `master-boot.sh` until Pi-hole is up (Part 4).
+
+### Architecture and ports
+
+Android doesn't let non-root apps bind ports below 1024, and PRoot's "root" is only a fake one, so Pi-hole uses unprivileged ports:
+
+| Service       | Port inside PRoot | How clients reach it                          |
+| ------------- | ----------------- | --------------------------------------------- |
+| DNS           | 5353              | Magisk redirects incoming port 53 to 5353     |
+| Web dashboard | 8080              | Directly, from the LAN or over Tailscale      |
+
+The redirect uses the `nat PREROUTING` chain, so it applies to DNS traffic **arriving at** the phone (tailnet and LAN clients), not to the phone's own lookups. It matches any port-53 traffic, so forwarded queries to external resolvers (for example `8.8.8.8`) are redirected to Pi-hole too. If Pi-hole stops, those clients lose DNS.
+
+### Part 1: Install Pi-hole in PRoot
+
+**1. In Termux:** install PRoot and Ubuntu.
+
+```sh
+pkg install proot-distro
+proot-distro install ubuntu
+```
+
+**2. Enter the container and install dependencies.** The package index is empty on first start, so run `apt update` first.
+
+```sh
+proot-distro login ubuntu
+apt update && apt upgrade -y
+apt install curl wget sudo nano dialog tzdata iproute2 -y
+```
+
+**3. Still inside Ubuntu:** pre-seed the installer. The interactive installer fails in PRoot (it can't query routes without `CAP_NET_ADMIN`), so write the answers file first.
+
+```sh
+mkdir -p /etc/pihole
+cat > /etc/pihole/setupVars.conf << 'EOF'
+PIHOLE_INTERFACE=wlan0
+IPV4_ADDRESS=127.0.0.1/24
+IPV6_ADDRESS=
+PIHOLE_DNS_1=8.8.8.8
+PIHOLE_DNS_2=1.1.1.1
+INSTALL_WEB_SERVER=true
+INSTALL_WEB_INTERFACE=true
+LIGHTTPD_ENABLED=true
+QUERY_LOGGING=true
+DNSMASQ_LISTENING=all
+EOF
+```
+
+**4. Run the unattended installer** (it reads the file from step 3):
+
+```sh
+curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended
+```
+
+It ends with `System has not been booted with systemd as init system`. That is expected: there is no `systemd` in PRoot, so the installer can't start the service. Everything is installed; you start FTL yourself.
+
+**5. Move Pi-hole off the default ports** (inside Ubuntu):
+
+```sh
+pihole-FTL --config dns.port 5353
+pihole-FTL --config webserver.port "8080,[::]:8080"
+```
+
+**6. Disable the built-in NTP server.** FTL v6 tries to serve time on port 123, which it isn't allowed to bind, so Pi-hole diagnosis shows red `Permission denied` errors. The phone already keeps its own time, so turn it off:
+
+```sh
+pihole-FTL --config ntp.ipv4.active false
+pihole-FTL --config ntp.ipv6.active false
+```
+
+**7. Create the log directory and set the dashboard password.** PRoot doesn't recreate volatile folders such as `/var/run` or some log directories.
+
+```sh
+mkdir -p /var/log/pihole
+chown pihole:pihole /var/log/pihole
+pihole setpassword
+```
+
+**8. Start FTL and test the dashboard:**
+
+```sh
+pihole-FTL &
+curl -I http://127.0.0.1:8080/admin/     # expect HTTP 200 or 302
+```
+
+`pihole-FTL` has no restart option. To restart after changing settings (step 6 included), run `killall pihole-FTL` and then `pihole-FTL &` again.
+
+To test DNS itself before enabling the redirect, install `dnsutils` (not part of the tested package list) and query port 5353 directly:
+
+```sh
+apt install dnsutils -y
+dig @127.0.0.1 -p 5353 example.com
+```
+
+### Part 2: Blocklists and first-run fixes
+
+Pi-hole ships with StevenBlack's unified hosts list. A popular, deliberately conservative addition is [OISD](https://oisd.nl): in the dashboard go to **Adlists**, add `https://big.oisd.nl/`, then run `pihole -g` (or **Tools → Update Gravity**).
+
+- **Paste the plain URL only.** If you copy a link from a chat or Markdown page you can end up with `[https://big.oisd.nl/](https://big.oisd.nl/)` in the Address field. Pi-hole reads it literally, can't download it, and the list shows a red error.
+- **"Cannot open gravity database for writing"** when adding a list: the installer ran as root, so `/etc/pihole` can end up owned by the wrong user while FTL's web server runs as `pihole`. Inside Ubuntu run:
+  ```sh
+  chown -R pihole:pihole /etc/pihole
+  killall pihole-FTL
+  pihole-FTL &
+  pihole -g
+  ```
+  Run it **inside the container**: in the Android root shell you get `chown: bad user 'pihole'`, because the `pihole` user exists only inside Ubuntu. In testing, `chmod -R 775/777 /etc/pihole` and inserting the list with `pihole-FTL sqlite3` were also tried before the list finally appeared after `pihole -g` and an FTL restart. It isn't established that the `chmod` or SQL steps were needed, so try the `chown` + restart first.
+- **Some ads still get through.** Pi-hole only sees domain names. YouTube, Instagram and similar apps serve ads from the same domains as their content, and OISD intentionally leaves some trackers alone so apps don't break. For a domain you do want blocked, press **Deny** next to it in the Query Log.
+
+### Part 3: Start Pi-hole at boot (Termux:Boot)
+
+In Termux (a normal shell, **not** `su`), create the boot script. This assumes Termux:Boot is installed and has been opened once (see [SSH access](#optional-ssh-access) for the details).
+
+```sh
+cat > ~/.termux/boot/start-pihole.sh << 'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+
+# Restore the Termux environment that proot-distro needs
+export PATH=/data/data/com.termux/files/usr/bin:/system/bin
+export PREFIX=/data/data/com.termux/files/usr
+export HOME=/data/data/com.termux/files/home
+export LD_PRELOAD=/data/data/com.termux/files/usr/lib/libtermux-exec.so
+
+# Give Android's network and Termux time to come up
+sleep 15
+
+# Remove stale lock files and sockets from unclean shutdowns
+proot-distro login ubuntu -- rm -f /run/pihole/FTL.sock /run/pihole-FTL.pid /run/pihole-FTL.port /etc/pihole/pihole-FTL.db-journal 2>/dev/null
+
+# Run FTL in the foreground (-f) to keep PRoot alive; background the proot command
+nohup proot-distro login ubuntu -- pihole-FTL -f > /dev/null 2>&1 &
+EOF
+chmod 755 ~/.termux/boot/start-pihole.sh
+```
+
+**Also required on Samsung and other aggressive OEM skins:** set Termux:Boot's battery usage to **Unrestricted** (Settings → Apps → Termux:Boot → Battery), otherwise Android may never deliver the boot broadcast.
+
+**What each piece is for**, since all of it is needed:
+
+| Piece | Why |
+| ----- | --- |
+| The four `export` lines | Termux:Boot runs scripts with an almost empty environment. `proot-distro` is itself a shell script that needs `PATH`/`PREFIX`/`HOME`, and `LD_PRELOAD` loads `libtermux-exec.so`, which rewrites `#!/bin/...` shebangs to Termux's paths. Without them the script fails silently. |
+| `sleep 15` | An arbitrary settling delay. It is unrelated to the 10-second sleep in `master-boot.sh`; the two scripts run independently, in different contexts. |
+| The `rm -f` line | In PRoot, `/run` is an ordinary folder on flash storage, not RAM-backed `tmpfs`, so it is not emptied on reboot. A leftover PID file makes FTL think it is already running. `--` ends `proot-distro`'s own options. |
+| `pihole-FTL -f` | PRoot keeps the container alive only while the process it launched is alive. FTL normally daemonizes and exits its main process, which makes PRoot tear down the container, killing DNS and the dashboard. `-f` keeps FTL in the foreground. |
+| `nohup ... &` | Detaches the whole proot command from the boot script so the script can finish. |
+| `> /dev/null 2>&1` | Stops `nohup` from creating an ever-growing `nohup.out`. |
+
+`sshd` starts fine from Termux:Boot without the `export` lines because it is a native Termux binary, whereas `proot-distro` depends on the shebang rewriting.
+
+**Debugging a boot that didn't start Pi-hole:**
+
+1. Run the script by hand: `sh ~/.termux/boot/start-pihole.sh`. Errors show up directly.
+2. Check whether FTL is alive: `proot-distro login ubuntu -- pgrep -l pihole-FTL`. No output means it isn't running.
+3. To see what FTL itself says, run it in the foreground inside the container (`proot-distro login ubuntu`, then `pihole-FTL -f`). The `CAP_SYS_NICE`, `CAP_SYS_TIME` and `CAP_CHOWN` warnings it prints are normal in PRoot.
+4. To check that Termux:Boot ran at all, temporarily add `echo "boot script ran $(date)" >> /sdcard/Download/pihole-boot.log` as the first command after the `export` lines. If the file doesn't appear after a reboot, the problem is Android's battery/background restrictions, not the script.
+
+### Part 4: Enable the DNS redirect
+
+Once Pi-hole answers queries, open `/data/adb/service.d/master-boot.sh` and set `PIHOLE_REDIRECT=1` at the top. Reboot (or run the script as root). Afterwards, from another device, test with `nslookup google.com <phone-ip>`; the query should appear in the Pi-hole Query Log immediately.
+
+### Part 5: Point clients at Pi-hole
+
+**Devices on your tailnet**
+
+1. In the [Tailscale admin console](https://login.tailscale.com/admin/dns) go to **DNS → Global nameservers** and add the phone's Tailscale IP (`100.x.y.z`).
+2. Enable **Override local DNS**.
+3. Enable **Use with exit node** on that nameserver. Without it, a client that is using an exit node ignores this nameserver and falls back to a public one.
+4. Disconnect and reconnect Tailscale on the client so it picks up the change.
+
+The phone itself runs with `--accept-dns=false`, so it doesn't query itself. Note that this setting is tailnet-wide: if Pi-hole is down, every client using it loses DNS.
+
+**Android's "Private DNS" setting on clients must be Off (or Automatic).** It speaks DNS-over-TLS (port 853), needs a hostname with a valid certificate, and doesn't accept an IP address, so it can't point at Pi-hole. While it is set to a fixed provider it also overrides the tailnet's DNS entirely.
+
+**Devices on your home Wi-Fi**
+
+ISP-supplied routers often lock the DNS fields. Example: a Huawei HG8147X6 ONT whose DHCP hands out `8.8.8.8` plus the router itself as DNS, and whose DNS fields are greyed out. Clients then never learn about Pi-hole, and with `8.8.8.8` listed first they often bypass it even if they did. Your options:
+
+- **Per device (simplest):** set a static IP and put the phone's LAN IP in the DNS field(s) of each device you want filtered. Putting it in both fields avoids a fallback to a resolver that bypasses Pi-hole, but it means those devices have no DNS while the phone is off.
+- **Replace the DHCP source:** ask the ISP to switch the ONT to bridge mode and use your own router, where you can set Pi-hole as the DHCP-supplied DNS.
+- **Don't** enable Pi-hole's built-in DHCP server here. DHCP relies on broadcasts, which won't be handled reliably through Android Wi-Fi and PRoot, and if you turned off the router's DHCP you could leave the whole network without addresses.
+- **Never** forward port 53 on your router to the internet. That turns Pi-hole into an open resolver that gets abused for DDoS amplification.
+
+Away from home, a client must be connected to Tailscale to reach Pi-hole.
+
+### Verifying Pi-hole
+
+```sh
+# Is FTL running inside the container? (No output = not running)
+proot-distro login ubuntu -- pgrep -l pihole-FTL
+
+# From another machine on the LAN: expect 53 (dnsmasq, Pi-hole), 8080 (dashboard), 8022 (SSH)
+nmap -A <phone-lan-ip>
+
+# From a tailnet device: the query must show up in the Pi-hole Query Log
+nslookup google.com <phone-tailscale-ip>
+```
+
+`pihole status` isn't a reliable check here. Inside PRoot it can print `Cannot open netlink socket: Permission denied` and red ✗ marks for the ports even though it also reports that FTL is listening on 5353. PRoot blocks the low-level socket it uses; the daemon is fine.
+
+---
 
 ## Troubleshooting
 
-| Symptom                                                                                                                   | Likely cause                                                                                                                                                                                                             |
-| ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `avc: denied` in `dmesg`/`logcat`                                                                                         | SELinux blocking netlink/iptables calls. Patch with `magiskpolicy --live "permissive <domain>"` for the specific denied domain rather than a blanket `setenforce 0`.                                                     |
-| `tailscale0` never appears                                                                                                | Daemon crashed or fell back silently — check `logcat` for the process, confirm binary matches device ABI.                                                                                                                |
-| Client shows exit node selected but no internet, FORWARD counters stay at zero                                            | Missing `ip rule ... lookup main` for forwarded `tailscale0` traffic (see the boot script above) — packets arrive but have no route to resolve.                                                                          |
-| `ts-input` counters climb but `ts-forward` stays at zero                                                                  | Traffic is reaching the device as its _destination_, not passing through it — confirms the client isn't actually routing through this node yet, look at the client side.                                                 |
-| Client-side: exit node shows "connected" but nothing routes                                                               | On non-rooted Android clients, check battery optimization isn't throttling the Tailscale background service (Samsung devices are notably aggressive here), and confirm no conflicting VPN/private-DNS app is registered. |
-| Complete internet loss ("no internet" wifi warning), fixed only by full reboot (not wifi toggle)                          | Possible `nf_conntrack` table exhaustion from sustained exit-node traffic. Check `/proc/sys/net/netfilter/nf_conntrack_count` vs `nf_conntrack_max`; raise the max if pegged, and add it to the boot script.             |
-| Router's own outbound traffic works by raw IP (`ping 8.8.8.8`) but not by hostname (`ping google.com`)                    | DNS resolution issue, unrelated to routing. See below.                                                                                                                                                                   |
-| `pkg update`/`pkg install` fail with "all mirrors bad" over SSH, but work fine when Termux is opened physically on-device | The sshd process launched via Magisk `service.d`/`su <uid>` is missing the `inet` group and correct SELinux app context. See [SSH access](#ssh-access) above.                                                            |
+| Symptom | Likely cause |
+| ------- | ------------ |
+| `avc: denied` in `dmesg` / `logcat` | SELinux blocking netlink or iptables calls. Patch only the denied domain with `magiskpolicy --live "permissive <domain>"` rather than a blanket `setenforce 0`. |
+| `tailscale0` never appears | Daemon crashed or fell back silently. Check `logcat`, and confirm the binary matches your device's ABI. |
+| Client shows exit node selected but has no internet; FORWARD counters stay at zero | The `ip rule ... iif tailscale0` entries are missing (see step 4 of the boot script). Packets arrive but have no route to resolve. |
+| `ts-input` counters climb but `ts-forward` stays at zero | Traffic is reaching the device as its _destination_, not passing through it. The client isn't routing through this node yet; look at the client side. |
+| Client shows exit node "connected" but nothing routes | On non-rooted Android clients, check that battery optimization isn't throttling the Tailscale service (Samsung is notably aggressive) and that no conflicting VPN or private-DNS app is active. |
+| Complete internet loss ("no internet" Wi-Fi warning), fixed only by a full reboot (not a Wi-Fi toggle) | Possible `nf_conntrack` exhaustion under sustained exit-node traffic. Compare `/proc/sys/net/netfilter/nf_conntrack_count` with `nf_conntrack_max`. If it is pegged, raise the max, e.g. `echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max`, and add that line to `master-boot.sh`. |
+| `ping 8.8.8.8` works but `ping google.com` doesn't | DNS problem, not routing. If you enabled the Pi-hole redirect, first check that Pi-hole is running (or set `PIHOLE_REDIRECT=0` and reboot). Otherwise see [DNS troubleshooting](#dns-troubleshooting). |
+| Pi-hole diagnosis shows red `Permission denied` errors for port 123 | FTL's built-in NTP server can't bind a privileged port. Disable it (Pi-hole Part 1, step 6). |
+| "Cannot open gravity database for writing" | Wrong ownership on `/etc/pihole`, or FTL started before it was fixed. See [Blocklists and first-run fixes](#part-2-blocklists-and-first-run-fixes). |
+| A newly added adlist shows a red error | The URL was pasted with Markdown brackets (`[url](url)`). Use the plain `https://...` address. |
+| `chown: bad user 'pihole'` | You ran it in the Android root shell. The `pihole` user exists only inside Ubuntu (`proot-distro login ubuntu`). |
+| `pihole status` shows `netlink socket: Permission denied` and red ✗ ports | Harmless PRoot limitation. Check with `pgrep -l pihole-FTL` instead. |
+| Pi-hole didn't start after reboot (`pgrep` prints nothing) | Termux:Boot didn't run (battery set to anything but Unrestricted), or the script lacks the `export` lines or `-f`. See [Part 3](#part-3-start-pi-hole-at-boot-termuxboot). |
+| `FTL started!` but dashboard and DNS are dead | FTL was launched without `-f` from a script, so PRoot closed the container when FTL daemonized. Use `pihole-FTL -f` with `nohup ... &`. |
+| Tailnet client doesn't show up in the Query Log | Check, in order: the DNS redirect is on (`PIHOLE_REDIRECT=1`); the console nameserver has **Use with exit node** enabled; the client's Private DNS is Off. If it still times out, check that FTL accepts non-local clients (`pihole-FTL --config dns.listeningMode` should print `ALL`; set it with `pihole-FTL --config dns.listeningMode ALL` and restart FTL). |
+| Home devices ignore Pi-hole | The ISP router's DHCP hands out `8.8.8.8`. Set static DNS per device or use your own router. See [Part 5](#part-5-point-clients-at-pi-hole). |
+| `pkg update` / `pkg install` fail with "all mirrors bad" over SSH but work in Termux on-device | `sshd` was started from Magisk instead of Termux:Boot and lacks the `inet` group and app SELinux context. See [SSH access](#why-sshd-is-not-in-the-magisk-script). |
 
-### DNS troubleshooting deep-dive
+### DNS troubleshooting
 
-If hostname resolution fails device-wide (not just over SSH) while raw-IP connectivity works, check in this order:
+If hostname resolution fails device-wide while raw-IP connectivity works, check in this order:
 
-1. `dig google.com @8.8.8.8` — if this works, DNS traffic itself is fine; the problem is in Android's automatic resolver selection.
-2. Check Settings → Connections → Private DNS. If it's set to "Automatic," Android may be attempting DNS-over-TLS against your network's DHCP-assigned DNS servers — which can hang if those servers don't actually support DoT. This is common on **CGNAT ISP connections**: if your router's WAN IP is itself in `100.64.0.0/10`, your ISP may hand out internal-only DNS resolvers (also in that range) that are unreachable from LAN clients and don't speak DoT.
-3. Fix at the router: find the LAN-side DHCP settings and set static public DNS servers (`1.1.1.1`, `8.8.8.8`) instead of passing through WAN-assigned DNS.
-4. Fix on-device as a workaround: Wi-Fi → network settings → Advanced → IP settings → Static, and set DNS 1/DNS 2 manually to `8.8.8.8`/`1.1.1.1`.
-5. This is unrelated to the Tailscale/kernel-routing setup — CGNAT on your ISP's WAN connection does not interfere with Tailscale itself (Tailscale is designed to work behind CGNAT via DERP relay/direct connections), only with Android's own DNS server selection.
+1. `dig google.com @8.8.8.8`. If this works, DNS traffic itself is fine and the problem is Android's automatic resolver selection.
+2. Look at Settings → Connections → Private DNS. On "Automatic", Android may try DNS-over-TLS against your network's DHCP-assigned servers, which hangs if they don't support it. This is common on **CGNAT ISP connections**: if your router's WAN IP is in `100.64.0.0/10`, the ISP may hand out internal-only resolvers (also in that range) that LAN clients can't reach and that don't speak DoT.
+3. **Fix at the router (preferred):** in the LAN-side DHCP settings, set static public DNS servers (`1.1.1.1`, `8.8.8.8`) instead of passing through the WAN-assigned ones. On many ISP-supplied routers these fields are locked; then use the on-device workaround below, or your own router.
+4. **Workaround on the device:** Wi-Fi → network settings → Advanced → IP settings → Static, then set DNS 1 / DNS 2 to `8.8.8.8` / `1.1.1.1`.
+
+This is unrelated to the kernel-routing setup. CGNAT on your ISP connection doesn't affect Tailscale itself, which works behind CGNAT via direct connections or DERP relays; it only affects Android's DNS server selection.
+
+---
 
 ## Credits
 
-- [Tailscale](https://github.com/tailscale/tailscale) — upstream project
-- [android-kxxt/external_tailscale](https://github.com/android-kxxt/external_tailscale) — the Android fwmark/IP-rule/go-iptables patches this setup depends on
-- [Termux](https://github.com/termux) / [Termux:Boot](https://github.com/termux/termux-boot)
-- [proot-distro](https://github.com/termux/proot-distro) 
+- [Tailscale](https://github.com/tailscale/tailscale), the upstream project
+- [android-kxxt/external_tailscale](https://github.com/android-kxxt/external_tailscale), the Android fwmark / IP-rule / go-iptables patches this setup depends on
+- [Termux](https://github.com/termux) and [Termux:Boot](https://github.com/termux/termux-boot)
+- [proot-distro](https://github.com/termux/proot-distro)
 - [Pi-hole](https://pi-hole.net/)
 
 ## Disclaimer
 
-This runs a modified, community-patched build of Tailscale outside its officially supported deployment path, on a rooted device with SELinux partially set to permissive. Understand the security tradeoffs before exposing this as an exit node to devices or people you don't fully trust.
+This runs a modified, community-patched build of Tailscale outside its officially supported deployment path, on a rooted device. Depending on your device you may also need SELinux policy exceptions (see [Troubleshooting](#troubleshooting)). Understand the security tradeoffs before offering this as an exit node to devices or people you don't fully trust.
