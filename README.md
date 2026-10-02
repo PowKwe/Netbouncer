@@ -86,7 +86,7 @@ On top of the patched binary, **one additional fix was required on-device** that
 
 ## Master boot script (`master-boot.sh`)
 
-Install at `/data/adb/service.d/master-boot.sh`. Handles kernel forwarding, NAT, and launching `tailscaled` — **does not** launch sshd (see [SSH access](#ssh-access) for why).
+Install at `/data/adb/service.d/master-boot.sh`. Handles kernel forwarding, NAT, redirects dns requests (see [Pi-hole](#pi-hole-dns--ad-blocking-integration)) and launching `tailscaled` — **does not** launch sshd (see [SSH access](#ssh-access) for why).
 
 ```sh
 #!/system/bin/sh
@@ -115,19 +115,119 @@ iptables -t nat -I POSTROUTING -o wlan0 -j MASQUERADE
 iptables -I FORWARD -i tailscale0 -j ACCEPT
 iptables -I FORWARD -o tailscale0 -j ACCEPT
 
-# 6. Launch Tailscale in True Kernel Mode
+# 6. DNS Redirection (Android port 53 -> PRoot Pi-hole port 5353)
+iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5353
+
+iptables -t nat -C PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 5353
+
+# 7. Launch Tailscale in True Kernel Mode
 env XDG_CACHE_HOME=/data/adb/tailscale \
 /data/adb/tailscale/tailscaled \
 --state=/data/adb/tailscale/tailscaled.state \
 --socket=/data/adb/tailscale/tailscaled.sock &
 
-# 7. Wait for the tailscale0 interface to initialize, then disable its rp_filter
+# 8. Wait for the tailscale0 interface to initialize, then disable its rp_filter
 sleep 5
 echo 0 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2>/dev/null
 ```
 
 Adjust `wlan0` throughout if your device's uplink interface has a different name (check with `ip route get 8.8.8.8`).
 
+
+## Pi-hole DNS & Ad-Blocking Integration (PRoot Container)
+
+To turn this rooted Android node into a complete network-wide ad-blocker, Pi-hole (v6) runs inside an isolated Ubuntu PRoot container managed by proot-distro, bridged to the network via Magisk iptables redirection rules and kept alive across reboots via Termux:Boot.
+
+### Architecture & Port Mapping
+Because Android restricts non-root user-space applications from binding to privileged ports (< 1024), Pi-hole is configured with a split-port layout:
+
+  - DNS (Port 5353 inside PRoot): Intercepted at the system level by Magisk and redirected from standard port 53.
+
+  - Web Dashboard (Port 8080): Accessible locally or over Tailscale for administration.
+
+### Installation & Setup
+
+  1. **Install PRoot-Distro and Ubuntu inside Termux:**
+  ```sh
+  pkg install proot-distro
+  proot-distro install ubuntu
+  ```
+  2. **Install Required Dependencies inside Ubuntu:**
+  
+  Before running the Pi-hole installer, enter the container and install essential administrative and networking utilities:
+  ```sh
+  proot-distro login ubuntu
+  apt update && apt upgrade -y
+  apt install curl wget sudo nano dialog tzdata iproute2 -y
+  ```
+  3. **Configure Unattended Pi-hole Installation:**
+    Because standard interactive installation scripts fail inside a PRoot environment, we configure an automated (unattended) installation by creating the pre-seed variables file (``setupVars.conf``) beforehand using a Heredoc block. Run this inside Termux:
+
+  ```sh
+    mkdir -p /etc/pihole
+    cat << EOF > /etc/pihole/setupVars.conf
+    PIHOLE_INTERFACE=wlan0
+    IPV4_ADDRESS=127.0.0.1/24
+    IPV6_ADDRESS=
+    PIHOLE_DNS_1=8.8.8.8
+    PIHOLE_DNS_2=1.1.1.1
+    INSTALL_WEB_SERVER=true
+    INSTALL_WEB_INTERFACE=true
+    LIGHTTPD_ENABLED=true
+    QUERY_LOGGING=true
+    DNSMASQ_LISTENING=all
+    EOF
+  ```
+4. **Run the Automated Installer:**
+  Execute the official Pi-hole installer in non-interactive (unattended) mode, telling it to use the pre-seeded configuration file we just created:
+    ```sh
+    curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended
+    ```
+5. **Configure Boot Persistence for Pi-hole (``Termux:Boot``):**
+
+  Termux:Boot executes scripts in a stripped-down environment that lacks normal interactive session variables (``PATH``, ``PREFIX``, ``HOME``, and ``LD_PRELOAD``). Furthermore, PRoot requires the main process launched inside it to remain alive, or the container shuts down entirely.
+  
+  In Termux (regular session $): 
+  ```sh
+  cat << EOF > ~/.termux/boot/start-pihole.sh
+  #!/data/data/com.termux/files/usr/bin/sh
+
+# Restore the Termux environment variables required for proot-distro
+export PATH=/data/data/com.termux/files/usr/bin:/system/bin
+export PREFIX=/data/data/com.termux/files/usr
+export HOME=/data/data/com.termux/files/home
+export LD_PRELOAD=/data/data/com.termux/files/usr/lib/libtermux-exec.so
+
+# Wait for the Android network and Termux environment to fully initialize
+sleep 15
+
+# Clean up stale lock files or sockets from improper shutdowns
+proot-distro login ubuntu -- rm -f /run/pihole/FTL.sock /run/pihole-FTL.pid /run/pihole-FTL.port /etc/pihole/pihole-FTL.db-journal 2>/dev/null
+
+# Launch FTL in the foreground (-f) inside the container to keep PRoot alive, 
+# while sending the proot command itself to the background (&).
+nohup proot-distro login ubuntu -- pihole-FTL -f > /dev/null 2>&1 &
+  EOF
+
+  ```
+6. **Avoiding a collision with the Android daemon (``netd``):**
+  
+  Port 53 is blocked by the native operating system. We are moving Pi-hole services (version 6) to available ports:
+  ```sh
+  pihole-FTL --config dns.port 5353
+  pihole-FTL --config webserver.port "8080,[::]:8080"
+```
+7. **Creating the logs and launching the service:**
+
+  PRoot does not automatically recreate volatile folders (``/var/run`` or certain logs). We set the permissions and password, and start the daemon in the background:
+  ```sh
+  mkdir -p /var/log/pihole
+  chown pihole:pihole /var/log/pihole
+  pihole setpassword
+  ```
+  Either launch the service in the background with ``pihole-FTL &`` manually or reboot the device in order to launch ``start-pihole.sh`` 
 ## SSH access
 
 **Don't launch sshd from the Magisk `service.d` script.** Doing so via `su ${TERMUX_UID} -c ...` switches the process to Termux's UID number, but the resulting process does **not** get the same Linux group memberships or SELinux context a normally-launched Termux app process gets:
@@ -209,6 +309,7 @@ If hostname resolution fails device-wide (not just over SSH) while raw-IP connec
 - [Tailscale](https://github.com/tailscale/tailscale) — upstream project
 - [android-kxxt/external_tailscale](https://github.com/android-kxxt/external_tailscale) — the Android fwmark/IP-rule/go-iptables patches this setup depends on
 - [Termux](https://github.com/termux) / [Termux:Boot](https://github.com/termux/termux-boot)
+- [Pi-hole](https://pi-hole.net/)
 
 ## Disclaimer
 
