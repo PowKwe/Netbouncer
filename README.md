@@ -212,6 +212,11 @@ nohup proot-distro login ubuntu -- pihole-FTL -f > /dev/null 2>&1 &
   EOF
 
   ```
+Then give it running privileges:
+```sh
+chmod 755 ~/.termux/boot/start-pihole.sh
+```
+
 6. **Avoiding a collision with the Android daemon (``netd``):**
   
   Port 53 is blocked by the native operating system. We are moving Pi-hole services (version 6) to available ports:
