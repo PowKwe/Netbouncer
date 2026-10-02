@@ -309,6 +309,7 @@ If hostname resolution fails device-wide (not just over SSH) while raw-IP connec
 - [Tailscale](https://github.com/tailscale/tailscale) — upstream project
 - [android-kxxt/external_tailscale](https://github.com/android-kxxt/external_tailscale) — the Android fwmark/IP-rule/go-iptables patches this setup depends on
 - [Termux](https://github.com/termux) / [Termux:Boot](https://github.com/termux/termux-boot)
+- [proot-distro](https://github.com/termux/proot-distro) 
 - [Pi-hole](https://pi-hole.net/)
 
 ## Disclaimer
