@@ -9,7 +9,7 @@ Tested on a Samsung Galaxy S10+ (Exynos, codename `beyond2lte`), running **Linea
 | Component | Version | 
 | --------- | ------- | 
 | `external_tailscale` (patched fork) | 1.92.4-31-t1f91011a1 |
-| PRoot container kernel | Linux 6.17.0-PRoot-Distro, aarch64 |
+| PRoot-Distro reported kernel release | Linux 6.17.0-PRoot-Distro, aarch64 |
 | ROM | LineageOS 23.2-20260905-nightly-beyond2lte |
 | Magisk | v30.7 |
 | Pi-hole core / web / FTL | v6.4.3 / v6.6 / v6.7.1 |
