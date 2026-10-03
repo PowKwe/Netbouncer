@@ -503,7 +503,7 @@ This is unrelated to the kernel-routing setup. CGNAT on your ISP connection does
 
 - [Tailscale](https://github.com/tailscale/tailscale), the upstream project
 - [android-kxxt/external_tailscale](https://github.com/android-kxxt/external_tailscale), the Android fwmark / IP-rule / go-iptables patches this setup depends on
-- [Termux](https://github.com/termux) and [Termux:Boot](https://github.com/termux/termux-boot)
+- [Termux](https://github.com/termux) [Termux:Boot](https://github.com/termux/termux-boot) and [Termux:API](https://github.com/termux/termux-api)
 - [proot-distro](https://github.com/termux/proot-distro)
 - [Pi-hole](https://pi-hole.net/)
 
