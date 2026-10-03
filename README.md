@@ -4,6 +4,9 @@ Turns a rooted Android phone into a real **kernel-mode** Tailscale subnet router
 
 Tested on a Samsung Galaxy S10+ (Exynos, codename `beyond2lte`), running **LineageOS**, rooted with Magisk.
 
+<img width="1712" height="1127" alt="Screenshot 2026-10-03 184024" src="https://github.com/user-attachments/assets/4836af54-0899-451f-ab8c-82bbf98c108d" />
+
+
 **Tested versions** — these are moving targets; if something in this doc doesn't match your result, check this list first.
 
 | Component | Version | 
