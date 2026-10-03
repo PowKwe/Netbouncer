@@ -2,21 +2,19 @@
 
 Turns a rooted Android phone into a real **kernel-mode** Tailscale subnet router and exit node: a genuine `tailscale0` TUN interface with in-kernel routing and NAT, not Tailscale's `userspace-networking` fallback.
 
-Tested on a Samsung Galaxy S10+ (Exynos, codename `beyond2lte`), running **LineageOS** (not stock Samsung firmware), rooted with Magisk.
+Tested on a Samsung Galaxy S10+ (Exynos, codename `beyond2lte`), running **LineageOS**, rooted with Magisk.
 
 **Tested versions** — these are moving targets; if something in this doc doesn't match your result, check this list first.
 
-| Component | Version | How to check |
-| --------- | ------- | ------------- |
-| `external_tailscale` (patched fork) | 1.92.4-31-t1f91011a1 | `tailscale --socket=<sock> status --json` → `"Version"` field |
-| PRoot container kernel | Linux 6.17.0-PRoot-Distro, aarch64 | `proot-distro login ubuntu -- uname -a` |
-| ROM | LineageOS 23.2-20260905-nightly-beyond2lte | Settings → About phone → Software information |
-| Magisk | v30.7 | Magisk app → home screen, top version number |
-| Pi-hole core / web / FTL | v6.4.3 / v6.6 / v6.7.1 | `proot-distro login ubuntu -- pihole -v` |
-| Ubuntu release (inside PRoot) | 26.04.1 LTS "Resolute Raccoon" | `proot-distro login ubuntu -- cat /etc/os-release` |
-| Termux / Termux:Boot | _fill in_ | Termux: `pkg list-installed termux-tools` or long-press the app in launcher → App info; Termux:Boot has no in-app version, check the install source's listing (F-Droid/Play) |
-
-> **The router runs LineageOS, not stock Samsung firmware.** It has no Knox layer and no One UI skin; it's close to AOSP with LineageOS's own additions. All setup and troubleshooting steps in this doc that concern the router itself are written for that environment, not for stock Samsung firmware.
+| Component | Version | 
+| --------- | ------- | 
+| `external_tailscale` (patched fork) | 1.92.4-31-t1f91011a1 |
+| PRoot container kernel | Linux 6.17.0-PRoot-Distro, aarch64 |
+| ROM | LineageOS 23.2-20260905-nightly-beyond2lte |
+| Magisk | v30.7 |
+| Pi-hole core / web / FTL | v6.4.3 / v6.6 / v6.7.1 |
+| Ubuntu release (inside PRoot) | 26.04.1 LTS "Resolute Raccoon" |
+| Termux / Termux:Boot | 1.46.0+really1.45.0-1 aarch64 |
 
 **What's in this repo**
 
@@ -162,16 +160,6 @@ TABLE=$((1000 + IDX))
 
 # 4. Policy routing for traffic arriving from Tailscale. The deletes make the
 #    script safe to re-run without piling up duplicate rules.
-#
-#    Both rules are kept even though only one may do anything on a given
-#    device: testing on the S10+ found that the `main` table has NO default
-#    route after a cold boot (only the local link-scope entry), while
-#    Android's own per-interface table (netd-managed, below) does carry one.
-#    Rule 4999 is checked first but resolves nothing in that case, so the
-#    kernel falls through to rule 5000, which is the one actually providing
-#    the route. Keep both: `main` as a possible fast path on devices where
-#    it happens to be populated, and the per-interface table as the one you
-#    can actually rely on.
 ip rule del iif tailscale0 lookup main pref 4999 2>/dev/null
 ip rule add iif tailscale0 lookup main pref 4999
 if [ -n "$IDX" ]; then
@@ -441,13 +429,6 @@ chmod 755 ~/.termux/boot/start-pihole.sh
 
 `sshd` starts fine from Termux:Boot without the `export` lines because it is a native Termux binary, whereas `proot-distro` depends on the shebang rewriting.
 
-**Debugging a boot that didn't start Pi-hole:**
-
-1. Run the script by hand: `sh ~/.termux/boot/start-pihole.sh`. Errors show up directly.
-2. Check whether FTL is alive: `proot-distro login ubuntu -- pgrep -l pihole-FTL`. No output means it isn't running.
-3. To see what FTL itself says, run it in the foreground inside the container (`proot-distro login ubuntu`, then `pihole-FTL -f`). The `CAP_SYS_NICE`, `CAP_SYS_TIME` and `CAP_CHOWN` warnings it prints are normal in PRoot.
-4. To check that Termux:Boot ran at all, temporarily add `echo "boot script ran $(date)" >> /sdcard/Download/pihole-boot.log` as the first command after the `export` lines. If the file doesn't appear after a reboot, the problem is Android's battery/background restrictions, not the script.
-
 ### Part 4: Enable the DNS redirect
 
 Once Pi-hole answers queries, open `/data/adb/service.d/master-boot.sh` and set `PIHOLE_REDIRECT=1` at the top. Reboot (or run the script as root). Afterwards, from another device, test with `nslookup google.com <phone-ip>`; the query should appear in the Pi-hole Query Log immediately.
@@ -464,17 +445,6 @@ Once Pi-hole answers queries, open `/data/adb/service.d/master-boot.sh` and set 
 The phone itself runs with `--accept-dns=false`, so it doesn't query itself. Note that this setting is tailnet-wide: if Pi-hole is down, every client using it loses DNS.
 
 **Android's "Private DNS" setting on clients must be Off (or Automatic).** It speaks DNS-over-TLS (port 853), needs a hostname with a valid certificate, and doesn't accept an IP address, so it can't point at Pi-hole. While it is set to a fixed provider it also overrides the tailnet's DNS entirely.
-
-**Devices on your home Wi-Fi**
-
-ISP-supplied routers often lock the DNS fields. Example: a Huawei HG8147X6 ONT whose DHCP hands out `8.8.8.8` plus the router itself as DNS, and whose DNS fields are greyed out. Clients then never learn about Pi-hole, and with `8.8.8.8` listed first they often bypass it even if they did. Your options:
-
-- **Per device (simplest):** set a static IP and put the phone's LAN IP in the DNS field(s) of each device you want filtered. Putting it in both fields avoids a fallback to a resolver that bypasses Pi-hole, but it means those devices have no DNS while the phone is off.
-- **Replace the DHCP source:** ask the ISP to switch the ONT to bridge mode and use your own router, where you can set Pi-hole as the DHCP-supplied DNS.
-- **Don't** enable Pi-hole's built-in DHCP server here. DHCP relies on broadcasts, which won't be handled reliably through Android Wi-Fi and PRoot, and if you turned off the router's DHCP you could leave the whole network without addresses.
-- **Never** forward port 53 on your router to the internet. That turns Pi-hole into an open resolver that gets abused for DDoS amplification.
-
-Away from home, a client must be connected to Tailscale to reach Pi-hole.
 
 ### Verifying Pi-hole
 
