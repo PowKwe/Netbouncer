@@ -42,7 +42,7 @@ The setup uses a patched, Android-aware fork of Tailscale, [`android-kxxt/extern
 - replaces Tailscale's multi-rule `ip rule` insertion with a single rule at a priority that doesn't shadow Android's;
 - patches `go-iptables` to tolerate Android's non-standard iptables error strings.
 
-**One extra fix is needed on-device** and is not part of the upstream patch: explicit `ip rule` entries that make the kernel resolve a next hop for packets arriving on `tailscale0` (the first one points at the `main` table; the second at the Wi-Fi network's own routing table; see [step 4 of the boot script](#the-boot-script-master-bootsh)). Without them, packets reach the tun interface and are accepted by the `FORWARD` chain, but no route is found, so nothing is forwarded even though every iptables rule looks correct. This is what takes the router from "exit node offered, client connected, zero traffic" to working.
+**One extra fix is needed on-device** and is not part of the upstream patch: explicit `ip rule` entries that make the kernel resolve a next hop for packets arriving on `tailscale0` (the first one points at the `main` table; the second at Android's per-interface routing table for the uplink; see [step 4 of the boot script](#the-boot-script-master-bootsh)). Without them, packets reach the tun interface and are accepted by the `FORWARD` chain, but no route is found, so nothing is forwarded even though every iptables rule looks correct. This is what takes the router from "exit node offered, client connected, zero traffic" to working.
 
 ## Requirements
 
@@ -121,8 +121,8 @@ Install at `/data/adb/service.d/master-boot.sh`. It enables forwarding, adds the
 #!/system/bin/sh
 # --- Settings ---------------------------------------------------------------
 UPLINK=wlan0          # Interface that carries your internet/LAN traffic.
-                      # Find it with: ip route get 8.8.8.8 (or look for the
-                      # interface holding your LAN subnet in: ip route show)
+                      # Find it with: ip route get 8.8.8.8 (run this from a
+                      # host root shell — see the note below the script)
 PIHOLE_REDIRECT=0     # Set to 1 only after Pi-hole is installed and running
                       # (see the Pi-hole section). Leave at 0 otherwise, or
                       # DNS will break for every client using this node.
@@ -140,12 +140,24 @@ echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
 echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
 echo 0 > /proc/sys/net/ipv4/conf/$UPLINK/rp_filter
 
-# 3. Find Android's per-network routing table for the uplink (1000 + ifindex)
+# 3. Find Android's per-network routing table for the uplink (1000 + ifindex).
+#    This table is created and populated by Android's own netd, independently
+#    of this script — the script only reads from it, never writes to it.
 IDX=$(cat /sys/class/net/$UPLINK/ifindex 2>/dev/null)
 TABLE=$((1000 + IDX))
 
 # 4. Policy routing for traffic arriving from Tailscale. The deletes make the
 #    script safe to re-run without piling up duplicate rules.
+#
+#    Both rules are kept even though only one may do anything on a given
+#    device: testing on the S10+ found that the `main` table has NO default
+#    route after a cold boot (only the local link-scope entry), while
+#    Android's own per-interface table (netd-managed, below) does carry one.
+#    Rule 4999 is checked first but resolves nothing in that case, so the
+#    kernel falls through to rule 5000, which is the one actually providing
+#    the route. Keep both: `main` as a possible fast path on devices where
+#    it happens to be populated, and the per-interface table as the one you
+#    can actually rely on.
 ip rule del iif tailscale0 lookup main pref 4999 2>/dev/null
 ip rule add iif tailscale0 lookup main pref 4999
 if [ -n "$IDX" ]; then
@@ -182,9 +194,9 @@ echo 0 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2>/dev/null
 
 Notes on what the script does and doesn't cover:
 
-- **Why two `ip rule` entries?** The first (priority 4999) resolves routes from the `main` table. The second (priority 5000) falls back to Android's own table for the uplink, which is where the default route lives. Both only match traffic arriving on `tailscale0`, and both sit at lower numbers than Android's own rules (10000+), so they are checked first.
-- **The uplink table is computed once, at boot.** The Wi-Fi interface must exist when the script runs. If it doesn't, the second rule is skipped.
-- **Auto-detecting the uplink is unreliable, so it is set by hand.** On the tested device `/proc/net/route` contains no default route (Android keeps it in per-network tables, which also supports the two-rule explanation above), `ip route get` wasn't available in Termux, and `ip -o` output wasn't usable. Parsing `ip route show` for `dev <iface>` worked, but a fixed `UPLINK` is the simplest and most predictable.
+- **Why two `ip rule` entries, and which one actually matters.** The first (priority 4999) resolves routes from the `main` table. The second (priority 5000) falls back to Android's own per-interface table for the uplink (`1000 + ifindex`). Testing found that on this device, `main` has no default route at all after a cold boot — only the second rule, against Android's `netd`-managed table, actually resolves anything. Both rules are kept regardless: the `main`-table rule costs nothing to keep and may be the one that matters on a different device or Android version, while the per-interface table is the one shown to work here. Both only match traffic arriving on `tailscale0`, and both sit at lower numbers than Android's own rules (10000+), so they are checked first.
+- **The uplink table is computed once, at boot, from a table Android itself maintains.** The script does not create or populate table `1000 + ifindex` — it only reads from it. The Wi-Fi interface must exist when the script runs, and the table must have been populated by `netd` by that point; if the ifindex lookup fails, the second rule is skipped.
+- **Auto-detecting the uplink interface by name is unreliable, so it's set by hand.** `ip route get 8.8.8.8` reliably reports the correct outbound interface and next hop when run from a host Android root shell — it was used throughout testing to confirm gateways and interfaces. It is not reliable, however, inside a PRoot container (see [Part 1 of the Pi-hole section](#part-1-install-pi-hole-in-proot)): PRoot's syscall interception doesn't provide working netlink sockets, so commands like `ip route get` fail there with a generic error. Parsing `ip route show` output for `dev <iface>` in a portable way across BusyBox/toybox builds added fragility without enough payoff for a boot script, so a fixed `UPLINK` variable is used instead; confirm the right value once with `ip route get 8.8.8.8` from the host shell, then hardcode it.
 - **Mobile data isn't covered.** NAT is applied to `$UPLINK` only. To route out over cellular you would need a matching `MASQUERADE` rule for that interface (typically `rmnet*`).
 - **IPv6 is forwarded but not NATed.** The script enables IPv6 forwarding but only adds IPv4 (`iptables`) rules. Exit-node traffic is therefore effectively IPv4-only.
 
@@ -198,6 +210,9 @@ Confirm the router is actually forwarding traffic, not merely configured to:
 # Policy routing: your rules at 4999/5000 and Tailscale's rule should be
 # evaluated before Android's netd rules (lower number = checked first)
 ip rule
+
+# Which table the 5000 rule actually points at, and whether it has a route
+ip route show table $((1000 + $(cat /sys/class/net/wlan0/ifindex)))
 
 # Tailscale's own routing table
 ip route show table 52
@@ -227,9 +242,9 @@ Handy for administering the phone from your tailnet.
 Starting `sshd` from a Magisk `service.d` script (for example with `su <termux-uid> -c ...`) switches the process to Termux's UID, but it does **not** get the group memberships or SELinux context of a normally launched Termux app:
 
 |                 | Normal Termux launch                 | `su <uid>` from a Magisk script    |
-| --------------- | ------------------------------------ | ---------------------------------- |
-| Groups          | `...,3003(inet),9997(everybody),...` | _(none; just the base UID group)_  |
-| SELinux context | `u:r:untrusted_app_27:s0:...`        | `u:r:magisk:s0`                    |
+| --------------- | ------------------------------------- | ----------------------------------- |
+| Groups          | `...,3003(inet),9997(everybody),...`  | _(none; just the base UID group)_   |
+| SELinux context | `u:r:untrusted_app_27:s0:...`         | `u:r:magisk:s0`                     |
 
 The missing `inet` group (gid 3003) is what gates network socket creation for app processes. The symptom: over SSH into such an `sshd`, `pkg update` and `pkg install` fail with "all mirrors bad", yet the same commands work once you open Termux physically and start `sshd` there, because that process comes from Android's normal app-launch path.
 
@@ -269,9 +284,9 @@ Turns the phone into a network-wide ad-blocker. Pi-hole v6 runs inside an Ubuntu
 Android doesn't let non-root apps bind ports below 1024, and PRoot's "root" is only a fake one, so Pi-hole uses unprivileged ports:
 
 | Service       | Port inside PRoot | How clients reach it                          |
-| ------------- | ----------------- | --------------------------------------------- |
-| DNS           | 5353              | Magisk redirects incoming port 53 to 5353     |
-| Web dashboard | 8080              | Directly, from the LAN or over Tailscale      |
+| ------------- | ------------------ | ---------------------------------------------- |
+| DNS           | 5353                | Magisk redirects incoming port 53 to 5353      |
+| Web dashboard | 8080                | Directly, from the LAN or over Tailscale       |
 
 The redirect uses the `nat PREROUTING` chain, so it applies to DNS traffic **arriving at** the phone (tailnet and LAN clients), not to the phone's own lookups. It matches any port-53 traffic, so forwarded queries to external resolvers (for example `8.8.8.8`) are redirected to Pi-hole too. If Pi-hole stops, those clients lose DNS.
 
@@ -292,7 +307,7 @@ apt update && apt upgrade -y
 apt install curl wget sudo nano dialog tzdata iproute2 -y
 ```
 
-**3. Still inside Ubuntu:** pre-seed the installer. The interactive installer fails in PRoot (it can't query routes without `CAP_NET_ADMIN`), so write the answers file first.
+**3. Still inside Ubuntu:** pre-seed the installer. The interactive installer fails in PRoot (it can't query routes without `CAP_NET_ADMIN` — see the uplink-detection note under [The boot script](#the-boot-script-master-bootsh)), so write the answers file first.
 
 ```sh
 mkdir -p /etc/pihole
@@ -467,10 +482,10 @@ nslookup google.com <phone-tailscale-ip>
 ## Troubleshooting
 
 | Symptom | Likely cause |
-| ------- | ------------ |
+| ------- | ------------- |
 | `avc: denied` in `dmesg` / `logcat` | SELinux blocking netlink or iptables calls. Patch only the denied domain with `magiskpolicy --live "permissive <domain>"` rather than a blanket `setenforce 0`. |
 | `tailscale0` never appears | Daemon crashed or fell back silently. Check `logcat`, and confirm the binary matches your device's ABI. |
-| Client shows exit node selected but has no internet; FORWARD counters stay at zero | The `ip rule ... iif tailscale0` entries are missing (see step 4 of the boot script). Packets arrive but have no route to resolve. |
+| Client shows exit node selected but has no internet; FORWARD counters stay at zero | The `ip rule ... iif tailscale0` entries are missing, or neither resolves a route (see step 4 of the boot script and the note on `main` vs. the per-interface table). Packets arrive but have no route to resolve. |
 | `ts-input` counters climb but `ts-forward` stays at zero | Traffic is reaching the device as its _destination_, not passing through it. The client isn't routing through this node yet; look at the client side. |
 | Client shows exit node "connected" but nothing routes | On non-rooted Android clients, check that battery optimization isn't throttling the Tailscale service (Samsung is notably aggressive) and that no conflicting VPN or private-DNS app is active. |
 | Complete internet loss ("no internet" Wi-Fi warning), fixed only by a full reboot (not a Wi-Fi toggle) | Possible `nf_conntrack` exhaustion under sustained exit-node traffic. Compare `/proc/sys/net/netfilter/nf_conntrack_count` with `nf_conntrack_max`. If it is pegged, raise the max, e.g. `echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max`, and add that line to `master-boot.sh`. |
@@ -485,6 +500,7 @@ nslookup google.com <phone-tailscale-ip>
 | Tailnet client doesn't show up in the Query Log | Check, in order: the DNS redirect is on (`PIHOLE_REDIRECT=1`); the console nameserver has **Use with exit node** enabled; the client's Private DNS is Off. If it still times out, check that FTL accepts non-local clients (`pihole-FTL --config dns.listeningMode` should print `ALL`; set it with `pihole-FTL --config dns.listeningMode ALL` and restart FTL). |
 | Home devices ignore Pi-hole | The ISP router's DHCP hands out `8.8.8.8`. Set static DNS per device or use your own router. See [Part 5](#part-5-point-clients-at-pi-hole). |
 | `pkg update` / `pkg install` fail with "all mirrors bad" over SSH but work in Termux on-device | `sshd` was started from Magisk instead of Termux:Boot and lacks the `inet` group and app SELinux context. See [SSH access](#why-sshd-is-not-in-the-magisk-script). |
+| `ip route get` fails with `Not a route` / `An error :-)` | Ran inside a PRoot container. PRoot's syscall interception doesn't provide working netlink sockets, so commands that need them (like `ip route get`) fail. Run the command from the host Android root shell instead; the route it adds (or the information it reports) is still visible to processes inside the container, since PRoot shares the host's network namespace. |
 
 ### DNS troubleshooting
 
