@@ -4,7 +4,7 @@ Turns a rooted Android phone into a real **kernel-mode** Tailscale subnet router
 
 Tested on a Samsung Galaxy S10+ (Exynos, codename `beyond2lte`), running **LineageOS**, rooted with Magisk.
 
-**Tested versions** — these are moving targets; if something in this doc doesn't match your result, check this list first.
+**Tested versions:** these are moving targets; if something in this doc doesn't match your result, check this list first.
 
 | Component | Version | 
 | --------- | ------- | 
@@ -134,7 +134,7 @@ Install at `/data/adb/service.d/master-boot.sh`. It enables forwarding, adds the
 # --- Settings ---------------------------------------------------------------
 UPLINK=wlan0          # Interface that carries your internet/LAN traffic.
                       # Find it with: ip route get 8.8.8.8 (run this from a
-                      # host root shell — see the note below the script)
+                      # host root shell; see the note below the script)
 PIHOLE_REDIRECT=0     # Set to 1 only after Pi-hole is installed and running
                       # (see the Pi-hole section). Leave at 0 otherwise, or
                       # DNS will break for every client using this node.
@@ -154,7 +154,7 @@ echo 0 > /proc/sys/net/ipv4/conf/$UPLINK/rp_filter
 
 # 3. Find Android's per-network routing table for the uplink (1000 + ifindex).
 #    This table is created and populated by Android's own netd, independently
-#    of this script — the script only reads from it, never writes to it.
+#    of this script; the script only reads from it, never writes to it.
 IDX=$(cat /sys/class/net/$UPLINK/ifindex 2>/dev/null)
 TABLE=$((1000 + IDX))
 
@@ -197,7 +197,7 @@ echo 0 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2>/dev/null
 Notes on what the script does and doesn't cover:
 
 - **Why two `ip rule` entries, and which one actually matters.** The first (priority 4999) resolves routes from the `main` table. The second (priority 5000) falls back to Android's own per-interface table for the uplink (`1000 + ifindex`). Testing found that on this device, `main` has no default route at all after a cold boot. Only the second rule, against Android's `netd`-managed table, actually resolves anything. Both rules are kept regardless: the `main`-table rule costs nothing to keep and may be the one that matters on a different device or Android version, while the per-interface table is the one shown to work here. Both only match traffic arriving on `tailscale0`, and both sit at lower numbers than Android's own rules (10000+), so they are checked first.
-- **The uplink table is computed once, at boot, from a table Android itself maintains.** The script does not create or populate table `1000 + ifindex` — it only reads from it. The Wi-Fi interface must exist when the script runs, and the table must have been populated by `netd` by that point; if the ifindex lookup fails, the second rule is skipped.
+- **The uplink table is computed once, at boot, from a table Android itself maintains.** The script does not create or populate table `1000 + ifindex`; it only reads from it. The Wi-Fi interface must exist when the script runs, and the table must have been populated by `netd` by that point; if the ifindex lookup fails, the second rule is skipped.
 - **Auto-detecting the uplink interface by name is unreliable, so it's set by hand.** `ip route get 8.8.8.8` reliably reports the correct outbound interface and next hop when run from a host Android root shell  It was used throughout testing to confirm gateways and interfaces. It is not reliable, however, inside a PRoot container (see [Part 1 of the Pi-hole section](#part-1-install-pi-hole-in-proot)): PRoot's syscall interception doesn't provide working netlink sockets, so commands like `ip route get` fail there with a generic error. Parsing `ip route show` output for `dev <iface>` in a portable way across BusyBox/toybox builds added fragility without enough payoff for a boot script, so a fixed `UPLINK` variable is used instead; confirm the right value once with `ip route get 8.8.8.8` from the host shell, then hardcode it.
 - **Mobile data isn't covered.** NAT is applied to `$UPLINK` only. To route out over cellular you would need a matching `MASQUERADE` rule for that interface (typically `rmnet*`).
 - **IPv6 is forwarded but not NATed.** The script enables IPv6 forwarding but only adds IPv4 (`iptables`) rules. Exit-node traffic is therefore effectively IPv4-only.
@@ -309,7 +309,7 @@ apt update && apt upgrade -y
 apt install curl wget sudo nano dialog tzdata iproute2 -y
 ```
 
-**3. Still inside Ubuntu:** pre-seed the installer. The interactive installer fails in PRoot (it can't query routes without `CAP_NET_ADMIN` — see the uplink-detection note under [The boot script](#the-boot-script-master-bootsh)), so write the answers file first.
+**3. Still inside Ubuntu:** pre-seed the installer. The interactive installer fails in PRoot (it can't query routes without `CAP_NET_ADMIN`; see the uplink-detection note under [The boot script](#the-boot-script-master-bootsh)), so write the answers file first.
 
 ```sh
 mkdir -p /etc/pihole
